@@ -879,8 +879,8 @@ CREATE TABLE IF NOT EXISTS entries (
   sync_error TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_entries_reg_norm ON entries(reg_norm);
-CREATE INDEX IF NOT EXISTS idx_entries_id_norm  ON entries(id_norm);
+CREATE INDEX IF NOT EXISTS idx_entries_reg_created ON entries(reg_norm, created_at);
+CREATE INDEX IF NOT EXISTS idx_entries_id_created  ON entries(id_norm, created_at);
 CREATE INDEX IF NOT EXISTS idx_entries_created  ON entries(created_at);
 
 ==================================================
