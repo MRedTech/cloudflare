@@ -274,8 +274,8 @@ async function dbAll(env, sql, ...params) {
 }
 
 function retentionDays(env) {
-  const n = parseInt(toText(env.RETENTION_DAYS) || "120", 10);
-  return Number.isFinite(n) && n > 0 ? n : 120;
+  const n = parseInt(toText(env.RETENTION_DAYS) || "90", 10);
+  return Number.isFinite(n) && n > 0 ? n : 90;
 }
 
 function gasFallbackEnabled(env) {
