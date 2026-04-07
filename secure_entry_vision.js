@@ -46,7 +46,7 @@ export default {
             ]
           }]
         })
-      }); // Kesilapan koma dibetulkan di sini
+      }); 
 
       const geminiData = await geminiRes.json();
       if (geminiData.error) throw new Error(geminiData.error.message);
