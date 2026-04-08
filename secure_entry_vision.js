@@ -47,14 +47,21 @@ export default {
               parts: [
                 {
                   text:
-                    "Extract only the person's full name and ID number from this identity document image. " +
+                    "You are extracting data from an identity document image. " +
                     "Return JSON only with this exact format: " +
                     "{\"name\":\"...\",\"idnum\":\"...\"}. " +
-                    "Rules: " +
-                    "1) name must be the full person name only; " +
-                    "2) idnum must be the identification number only; " +
-                    "3) do not include labels, explanations or markdown; " +
-                    "4) if unsure, return empty string for the field."
+                    "Rules for name: " +
+                    "1) Extract only the person's full name. " +
+                    "2) Do NOT include address, city, state, country, postcode, nationality, religion, gender, birth date, expiry date, issue date, document labels, document titles, or any other non-name text. " +
+                    "3) Do NOT return words like MALAYSIA, MYKAD, PASSPORT, IDENTITY CARD, LESEN MEMANDU, DRIVING LICENCE, WARGANEGARA, ALAMAT, ADDRESS, or state names as part of the name. " +
+                    "4) If unsure, return empty string for name. " +
+                    "Rules for idnum: " +
+                    "5) Extract the main identity document number only. This may be a MyKad number, passport number, or driving licence number. " +
+                    "6) Do NOT include labels such as NO., NO K/P, NO. K/P, PASSPORT NO, PASSPORT NUMBER, LICENCE NO, IDENTITY CARD NO, or any explanation. " +
+                    "7) If multiple numbers appear, choose the primary document number belonging to the document holder. " +
+                    "8) Do NOT return address numbers, postcode, phone number, date of birth, expiry date, or random codes as idnum. " +
+                    "9) Do not include markdown, code fences, or extra text. " +
+                    "10) If unsure, return empty string for the field."
                 },
                 {
                   inline_data: {
@@ -67,7 +74,7 @@ export default {
           ],
           generationConfig: {
             temperature: 0,
-            maxOutputTokens: 100,
+            maxOutputTokens: 120,
             response_mime_type: "application/json",
             response_schema: {
               type: "OBJECT",
@@ -116,7 +123,7 @@ export default {
 
       return jsonResponse({
         name: cleanText(result.name || ""),
-        idnum: cleanText(result.idnum || ""),
+        idnum: cleanIdNum(result.idnum || ""),
         raw: "OCR Berjaya"
       });
 
@@ -132,6 +139,39 @@ export default {
 
 function cleanText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function cleanIdNum(value) {
+  let v = String(value || "").toUpperCase().trim();
+  if (!v) return "";
+
+  v = v
+    .replace(/\b(PASSPORT\s*NO|PASSPORT\s*NUMBER|PASSPORT|NO\.\s*K\/P|NO\s*K\/P|NO\s*KP|NO\.?\s*IC|IC\s*NO|MYKAD|IDENTITY\s*CARD\s*NO|IDENTITY\s*CARD|LICENCE\s*NO|DRIVING\s*LICENCE|LESEN\s*MEMANDU|NO\.)\b/gi, " ")
+    .replace(/[:;]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Cuba detect MyKad 12 digit
+  const digitsOnly = v.replace(/\D/g, "");
+  if (digitsOnly.length === 12) {
+    return `${digitsOnly.slice(0, 6)}-${digitsOnly.slice(6, 8)}-${digitsOnly.slice(8)}`;
+  }
+
+  // Jika sudah ada format MyKad
+  const mykadMatch = v.match(/\b(\d{6})-?(\d{2})-?(\d{4})\b/);
+  if (mykadMatch) {
+    return `${mykadMatch[1]}-${mykadMatch[2]}-${mykadMatch[3]}`;
+  }
+
+  // Untuk passport / lesen: buang simbol tak perlu, kekalkan huruf+angka sahaja
+  v = v.replace(/[^A-Z0-9]/g, "");
+
+  // Had kasar supaya tak terlalu panjang
+  if (v.length > 20) {
+    v = v.slice(0, 20);
+  }
+
+  return v;
 }
 
 function jsonResponse(data, status = 200) {
