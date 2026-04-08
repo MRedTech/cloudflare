@@ -1,80 +1,148 @@
-export default { 
+export default {
   async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") {
       return new Response("", { headers: corsHeaders() });
     }
-    if (request.method !== "POST") {
-      return new Response(JSON.stringify({ error: true, message: "Use POST only." }), {
-        status: 405,
-        headers: corsHeaders(),
-      });
-    }
 
     try {
-      const { image } = await request.json();
-      const GEMINI_API_KEY = env.GEMINI_API_KEY; 
-      const model = "gemini-1.5-flash";
-      
-      // Menggunakan v1
-      const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      if (request.method !== "POST") {
+        return jsonResponse({
+          error: true,
+          message: "Method tidak dibenarkan."
+        }, 405);
+      }
+
+      const bodyText = await request.text();
+      if (!bodyText) {
+        throw new Error("Tiada data imej diterima daripada peranti.");
+      }
+
+      let payload;
+      try {
+        payload = JSON.parse(bodyText);
+      } catch {
+        throw new Error("Format JSON tidak sah.");
+      }
+
+      let { image } = payload;
+      if (!image || typeof image !== "string") {
+        throw new Error("Data imej tiada atau tidak sah.");
+      }
+
+      if (!env.GEMINI_API_KEY) {
+        throw new Error("GEMINI_API_KEY belum diset.");
+      }
+
+      const url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash-lite:generateContent";
 
       const geminiRes = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": env.GEMINI_API_KEY
+        },
         body: JSON.stringify({
-          contents: [{
-            parts: [
-              { 
-                text: "Bertindak sebagai pakar OCR Dokumen Identiti (MyKad, Pasport Antarabangsa, Lesen Memandu). " +
-                      "Tugas anda adalah mengekstrak 'name' dan 'idnum' dalam format JSON yang sah. " +
-                      "\n\nLOGIK EKSTRAKSI:" +
-                      "\n1. MYKAD/LESEN: Cari nombor 12-digit. Formatkan 'idnum' dengan dash (contoh: 900101-10-5522). Nama mestilah nama penuh pemegang." +
-                      "\n2. PASSPORT: Kenalpasti bahagian bawah dokumen (MRZ). Ekstrak nombor pasport (biasanya bermula huruf + 8/9 digit) dan nama penuh. " +
-                      "Buang simbol '<<' atau gelaran seperti 'MR/MRS'. Gunakan penaakulan jika teks di atas kabur tetapi MRZ jelas." +
-                      "\n3. KUALITI RENDAH: Jika imej silau atau gelap, gunakan konteks sekeliling untuk meneka teks yang paling logik." +
-                      "\n\nSYARAT OUTPUT (WAJIB):" +
-                      "\n- HANYA pulangkan objek JSON: {\"name\": \"...\", \"idnum\": \"...\"}." +
-                      "\n- Jangan berikan sebarang teks penjelasan, pengenalan, atau markdown." +
-                      "\n- Jika gagal temui data, pulangkan: {\"name\": \"\", \"idnum\": \"\"}."
+          contents: [
+            {
+              parts: [
+                {
+                  text:
+                    "Extract only the person's full name and ID number from this identity document image. " +
+                    "Return JSON only with this exact format: " +
+                    "{\"name\":\"...\",\"idnum\":\"...\"}. " +
+                    "Rules: " +
+                    "1) name must be the full person name only; " +
+                    "2) idnum must be the identification number only; " +
+                    "3) do not include labels, explanations or markdown; " +
+                    "4) if unsure, return empty string for the field."
+                },
+                {
+                  inline_data: {
+                    mime_type: "image/jpeg",
+                    data: image
+                  }
+                }
+              ]
+            }
+          ],
+          generationConfig: {
+            temperature: 0,
+            maxOutputTokens: 100,
+            response_mime_type: "application/json",
+            response_schema: {
+              type: "OBJECT",
+              properties: {
+                name: { type: "STRING" },
+                idnum: { type: "STRING" }
               },
-              { 
-                inline_data: { 
-                  mime_type: "image/jpeg", 
-                  data: image 
-                } 
-              }
-            ]
-          }]
+              required: ["name", "idnum"]
+            }
+          }
         })
-      }); 
+      });
 
-      const geminiData = await geminiRes.json();
-      if (geminiData.error) throw new Error(geminiData.error.message);
+      const geminiText = await geminiRes.text();
 
-      let aiContent = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-      
-      // Pembersihan tag markdown sekiranya Gemini memulangkan ```json ... ```
-      aiContent = aiContent.replace(/```json|```/g, "").trim();
-      
-      const result = JSON.parse(aiContent);
+      if (!geminiRes.ok) {
+        throw new Error(`Gemini HTTP ${geminiRes.status}: ${geminiText || "Tiada butiran ralat"}`);
+      }
 
-      return new Response(JSON.stringify({
-        name: result.name || "",
-        idnum: result.idnum || "",
-        raw: "Processed by Gemini 1.5 Flash v1"
-      }), {
-        headers: { ...corsHeaders(), "Content-Type": "application/json" }
+      if (!geminiText) {
+        throw new Error("Google memulangkan respon kosong.");
+      }
+
+      let data;
+      try {
+        data = JSON.parse(geminiText);
+      } catch {
+        throw new Error("Respon Gemini bukan JSON yang sah.");
+      }
+
+      if (data.error) {
+        throw new Error(`Google Error: ${data.error.message}`);
+      }
+
+      const aiText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!aiText) {
+        throw new Error("Tiada candidate text daripada Gemini.");
+      }
+
+      let result;
+      try {
+        result = JSON.parse(aiText);
+      } catch {
+        throw new Error("Output Gemini bukan JSON yang sah.");
+      }
+
+      return jsonResponse({
+        name: cleanText(result.name || ""),
+        idnum: cleanText(result.idnum || ""),
+        raw: "OCR Berjaya"
       });
 
     } catch (err) {
-      console.error("RALAT WORKER:", err.message); 
-      return new Response(JSON.stringify({ error: true, message: err.message }), {
-        status: 400,
-        headers: { ...corsHeaders(), "Content-Type": "application/json" }
-      });
+      console.error("RALAT WORKER:", err.message);
+      return jsonResponse({
+        error: true,
+        message: `Ralat: ${err.message}`
+      }, 200);
     }
   }
 };
+
+function cleanText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders(),
+      "Content-Type": "application/json"
+    }
+  });
+}
 
 function corsHeaders() {
   return {
