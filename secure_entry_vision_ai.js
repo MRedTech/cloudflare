@@ -24,7 +24,7 @@ export default {
         throw new Error("Invalid JSON format.");
       }
 
-      let { image } = payload;
+      const { image } = payload;
       if (!image || typeof image !== "string") {
         throw new Error("Image data is missing or invalid.");
       }
@@ -34,9 +34,9 @@ export default {
       }
 
       const MODEL = (env.GEMINI_MODEL || "gemini-2.5-flash-lite").trim();
-      const url = `https://generativelanguage.googleapis.com/v1/models/${MODEL}:generateContent`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
-      const geminiRes = await fetch(url, {
+      const requestOptions = {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -87,13 +87,9 @@ export default {
             }
           }
         })
-      });
+      };
 
-      const geminiText = await geminiRes.text();
-
-      if (!geminiRes.ok) {
-        throw new Error(`Gemini HTTP ${geminiRes.status}: ${geminiText || "No error details provided."}`);
-      }
+      const { text: geminiText } = await fetchWithRetry(url, requestOptions, 3);
 
       if (!geminiText) {
         throw new Error("Google returned an empty response.");
@@ -130,13 +126,61 @@ export default {
 
     } catch (err) {
       console.error("WORKER ERROR:", err.message);
+
+      const friendlyMessage =
+        /Gemini HTTP 503/i.test(err.message)
+          ? "AI service is temporarily busy. Please try again."
+          : /Gemini HTTP 500/i.test(err.message)
+            ? "AI service encountered a temporary server error. Please try again."
+            : /Gemini HTTP 429/i.test(err.message)
+              ? "Too many requests at the moment. Please try again shortly."
+              : err.message;
+
       return jsonResponse({
         error: true,
-        message: `Error: ${err.message}`
+        message: `Error: ${friendlyMessage}`
       }, 200);
     }
   }
 };
+
+async function fetchWithRetry(url, options, maxRetries = 3) {
+  let lastStatus = 0;
+  let lastText = "";
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, options);
+    const text = await res.text();
+
+    lastStatus = res.status;
+    lastText = text;
+
+    if (res.ok) {
+      return { res, text };
+    }
+
+    if (res.status === 429) {
+      throw new Error("Gemini HTTP 429: Too many requests. Please try again shortly.");
+    }
+
+    const shouldRetry = [500, 503].includes(res.status);
+    if (!shouldRetry || attempt === maxRetries) {
+      throw new Error(`Gemini HTTP ${res.status}: ${text || "No error details provided."}`);
+    }
+
+    const delayMs =
+      Math.min(4000, 700 * Math.pow(2, attempt)) +
+      Math.floor(Math.random() * 250);
+
+    await sleep(delayMs);
+  }
+
+  throw new Error(`Gemini HTTP ${lastStatus}: ${lastText || "No error details provided."}`);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function cleanText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
