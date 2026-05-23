@@ -724,7 +724,7 @@ export default {
             const shaBuf = await crypto.subtle.digest("SHA-256", bytes);
             shaHex = bufToHex(shaBuf);
 
-            const prefix = toText(env.R2_PREFIX) || "sensory";
+            const prefix = toText(env.R2_PREFIX) || "m_panora";
             imageKey = `${prefix}/${utcYmd(new Date())}/${id}.jpg`;
 
             await env.BUCKET.put(imageKey, bytes, {
