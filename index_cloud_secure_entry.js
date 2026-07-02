@@ -644,7 +644,12 @@ export default {
   async fetch(request, env, ctx) {
     const cors = corsHeaders();
 
-    if (request.method === "OPTIONS") return textResp("", 204, cors);
+    if (request.method === "OPTIONS") {
+  return new Response(null, {
+    status: 204,
+    headers: cors
+  });
+}
 
     const url = new URL(request.url);
     const path = url.pathname;
