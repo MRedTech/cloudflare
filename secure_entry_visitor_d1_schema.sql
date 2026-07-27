@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS entries (
   sync_version INTEGER NOT NULL DEFAULT 1
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_one_active_visitor
+  ON entries(id_norm)
+  WHERE visit_status = 'CHECKED_IN'
+    AND (check_out_time IS NULL OR check_out_time = '')
+    AND id_norm <> '';
+
 CREATE INDEX IF NOT EXISTS idx_entries_reg_created
   ON entries(reg_norm, created_at DESC);
 
