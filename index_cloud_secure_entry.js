@@ -645,11 +645,11 @@ export default {
     const cors = corsHeaders();
 
     if (request.method === "OPTIONS") {
-  return new Response(null, {
-    status: 204,
-    headers: cors
-  });
-}
+      return new Response(null, {
+        status: 204,
+        headers: cors,
+      });
+    }
 
     const url = new URL(request.url);
     const path = url.pathname;
