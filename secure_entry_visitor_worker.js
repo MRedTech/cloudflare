@@ -1379,7 +1379,7 @@ function ePassHtml(env, session, snapshot, activityLog = [], parkingNotice = nul
     <div class="charge-notice-row"><span>${sessionFinalised ? "FINAL CHARGE" : "CURRENT CHARGE"}</span><b id="noticeCharge">${htmlEscape(snapshot.currentCharge)}</b></div>\
     ${noticeNumberLine}${noticeStatusLine}\
     <p>${htmlEscape(noticeMessage)}</p>\
-    <strong>PAYMENT IS NOT COLLECTED AT THE GUARD HOUSE. PLEASE REFER TO THE MANAGEMENT OFFICE.</strong>\
+    <strong>PAYMENT IS NOT COLLECTED AT THE GUARD HOUSE.</strong>\
   </section>`;
 
   const initialJson = JSON.stringify({
