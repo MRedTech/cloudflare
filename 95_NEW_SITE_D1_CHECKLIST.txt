@@ -1,0 +1,19 @@
+NEW SITE D1 CHECKLIST
+
+[ ] Create a NEW empty D1 database for the site.
+[ ] Open D1 Console / Explore Data.
+[ ] Run 01_NEW_SITE_COMPLETE_SCHEMA.sql only.
+[ ] Run 90_VERIFY_D1_SETUP.sql.
+[ ] Confirm all six summary fields show OK.
+[ ] Confirm these four tables exist:
+    entries
+    parking_sessions
+    parking_intervals
+    parking_notices
+[ ] Bind the correct D1 database to the correct site Worker.
+[ ] Deploy the current schemaVersion 5 Worker.
+[ ] Check /health and confirm:
+    schemaVersion: 5
+    parkingNotice: true
+    noticeDeliveryMode: AFTER_RESET
+[ ] Do not run files 10, 11 or 12 on this new database.
