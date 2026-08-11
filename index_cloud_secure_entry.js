@@ -6,6 +6,8 @@
 //   * Apps Script returns driveFileId/driveUrl (if new photo) -> Worker updates D1
 // - GET / or /search: FAST search from D1 (no Sheet scan) with the same response format as Apps Script doGet
 // - GET /image: protected fetch for Apps Script to pull image from R2
+// - GET /search-record/delivery: protected D1 Search Record (query/date + pagination)
+// - GET /search-record/delivery/photo: protected Search Record photo fetch
 // - scheduled: retry sync + cleanup old D1 rows + (optional) auto-delete Drive files
 // ==================================================
 
@@ -574,6 +576,653 @@ async function d1Search(env, field, value) {
   };
 }
 
+
+/** =========================
+ * Delivery Dashboard (D1 read-only statistics)
+ * - Mirrors the current GAS dashboard calculation rules
+ * - Includes only the 3 active delivery groups
+ * - Excludes internal PROOF_* rows
+ * - Uses Malaysia time (UTC+08:00) for date filtering and hourly statistics
+ * ========================= */
+const DASHBOARD_CATEGORY_GROUPS = Object.freeze({
+  "GRAB FOOD": "FOOD DELIVERY",
+  "FOOD PANDA": "FOOD DELIVERY",
+  "SHOPEE FOOD": "FOOD DELIVERY",
+  "MCD FOOD DELIVERY": "FOOD DELIVERY",
+  "RESTAURANT DELIVERY": "FOOD DELIVERY",
+  "DOMINOS DELIVERY": "FOOD DELIVERY",
+  "DHL": "PARCEL / COURIER",
+  "FLASH EXPRESS": "PARCEL / COURIER",
+  "GDEX": "PARCEL / COURIER",
+  "J&T EXPRESS": "PARCEL / COURIER",
+  "NINJA VAN": "PARCEL / COURIER",
+  "POS LAJU": "PARCEL / COURIER",
+  "SHOPEE EXPRESS": "PARCEL / COURIER",
+  "LAZADA": "PARCEL / COURIER",
+  "LALAMOVE": "PARCEL / COURIER",
+  "ABX EXPRESS": "PARCEL / COURIER",
+  "CITY LINK": "PARCEL / COURIER",
+  "FEDEX": "PARCEL / COURIER",
+  "SKYNET": "PARCEL / COURIER",
+  "E-HAILING": "E-HAILING / DROP OFF / PICK UP",
+  "DROP OFF / PICK UP": "E-HAILING / DROP OFF / PICK UP",
+  "OWNER": "OWNER / TENANT",
+  "TENANT": "OWNER / TENANT",
+  "OTHER": "OTHERS",
+});
+
+const DASHBOARD_ACTIVE_GROUPS = Object.freeze([
+  "FOOD DELIVERY",
+  "PARCEL / COURIER",
+  "E-HAILING / DROP OFF / PICK UP",
+]);
+
+const DASHBOARD_GROUP_CHART_ORDER = Object.freeze([
+  "FOOD DELIVERY",
+  "E-HAILING / DROP OFF / PICK UP",
+  "PARCEL / COURIER",
+]);
+
+const MALAYSIA_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+function dashboardNormalizeCategory(value) {
+  let text = toUpper(value);
+  if (!text) return "";
+
+  text = text
+    .replace(/\s+/g, " ")
+    .replace(/\s*\/\s*/g, " / ")
+    .replace(/\s*-\s*/g, "-")
+    .trim();
+
+  if (text === "E HAILING" || text === "EHAILING" || text === "E-HAILING") {
+    return "E-HAILING";
+  }
+
+  if (
+    text === "DROP OFF/PICK UP" ||
+    text === "DROP OFF / PICK UP" ||
+    text === "DROP-OFF / PICK-UP" ||
+    text === "DROP OFF / PICK-UP" ||
+    text === "DROP-OFF / PICK UP" ||
+    text === "DROPOFF/PICKUP" ||
+    text === "DROP OFF" ||
+    text === "DROP-OFF" ||
+    text === "PICK UP" ||
+    text === "PICK-UP"
+  ) {
+    return "DROP OFF / PICK UP";
+  }
+
+  if (text === "DOMINOS" || text === "DOMINO'S DELIVERY" || text === "DOMINOS DELIVERY") {
+    return "DOMINOS DELIVERY";
+  }
+  if (text === "ABX" || text === "ABX EXPRESS") return "ABX EXPRESS";
+  if (text === "CITYLINK" || text === "CITY LINK") return "CITY LINK";
+  if (text === "FED EX" || text === "FEDEX") return "FEDEX";
+  if (text === "SKY NET" || text === "SKYNET") return "SKYNET";
+  if (text === "OTHERS") return "OTHER";
+
+  const known = Object.keys(DASHBOARD_CATEGORY_GROUPS);
+  for (const category of known) {
+    if (text === category || text.startsWith(category + " ") || text.startsWith(category + "(")) {
+      return category;
+    }
+  }
+  return text;
+}
+
+function dashboardNormalizeTower(value) {
+  const tower = toUpper(value);
+  if (tower === "TOWER A") return "Tower A";
+  if (tower === "TOWER B") return "Tower B";
+  if (tower === "TOWER A & B") return "Tower A & B";
+  return toText(value);
+}
+
+function parseYmd(value) {
+  const s = toText(value);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const test = new Date(Date.UTC(year, month - 1, day));
+  if (
+    test.getUTCFullYear() !== year ||
+    test.getUTCMonth() !== month - 1 ||
+    test.getUTCDate() !== day
+  ) return null;
+  return { year, month, day, ymd: s };
+}
+
+function malaysiaPartsFromMs(ms) {
+  const d = new Date(ms + MALAYSIA_OFFSET_MS);
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+    second: d.getUTCSeconds(),
+  };
+}
+
+function malaysiaPartsFromIso(value) {
+  const ms = Date.parse(toText(value));
+  if (!Number.isFinite(ms)) return null;
+  return malaysiaPartsFromMs(ms);
+}
+
+function ymdFromParts(parts) {
+  return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+}
+
+function malaysiaTodayYmd() {
+  return ymdFromParts(malaysiaPartsFromMs(Date.now()));
+}
+
+function localMidnightUtcIso(parts, addDays = 0) {
+  const utcMs = Date.UTC(parts.year, parts.month - 1, parts.day + addDays, 0, 0, 0) - MALAYSIA_OFFSET_MS;
+  return new Date(utcMs).toISOString();
+}
+
+function dashboardResolveDateRange(startRaw, endRaw) {
+  const today = malaysiaTodayYmd();
+  let start = parseYmd(startRaw) || parseYmd(today);
+  let end = parseYmd(endRaw) || parseYmd(today);
+
+  if (start.ymd > end.ymd) {
+    const temp = start;
+    start = end;
+    end = temp;
+  }
+
+  return {
+    startYmd: start.ymd,
+    endYmd: end.ymd,
+    startUtc: localMidnightUtcIso(start, 0),
+    endExclusiveUtc: localMidnightUtcIso(end, 1),
+  };
+}
+
+function dashboardMonthBuckets() {
+  const now = malaysiaPartsFromMs(Date.now());
+  const monthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+  const buckets = [];
+
+  for (let i = 2; i >= 0; i--) {
+    const d = new Date(Date.UTC(now.year, now.month - 1 - i, 1));
+    const year = d.getUTCFullYear();
+    const month = d.getUTCMonth() + 1;
+    buckets.push({
+      key: year * 100 + month,
+      year,
+      month,
+      label: `${monthNames[month - 1]} ${year}`,
+      foodDelivery: 0,
+      eHailing: 0,
+      parcelCourier: 0,
+    });
+  }
+
+  const first = buckets[0];
+  const last = buckets[buckets.length - 1];
+  const nextMonth = new Date(Date.UTC(last.year, last.month, 1));
+
+  return {
+    buckets,
+    startUtc: new Date(Date.UTC(first.year, first.month - 1, 1) - MALAYSIA_OFFSET_MS).toISOString(),
+    endExclusiveUtc: new Date(Date.UTC(nextMonth.getUTCFullYear(), nextMonth.getUTCMonth(), 1) - MALAYSIA_OFFSET_MS).toISOString(),
+  };
+}
+
+function dashboardPercentage(count, total) {
+  return total ? Math.round((count / total) * 100) : 0;
+}
+
+function dashboardSortCountMap(map) {
+  return Array.from(map.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+
+async function buildDeliveryDashboard(env, startRaw, endRaw) {
+  const range = dashboardResolveDateRange(startRaw, endRaw);
+  const monthlyWindow = dashboardMonthBuckets();
+
+  const [filteredResult, monthlyResult] = await Promise.all([
+    dbAll(
+      env,
+      `SELECT created_at, remark, tower, image_key, client_txn_id
+         FROM entries
+        WHERE created_at >= ?
+          AND created_at < ?
+          AND client_txn_id NOT LIKE 'PROOF_%'
+        ORDER BY created_at ASC`,
+      range.startUtc,
+      range.endExclusiveUtc
+    ),
+    dbAll(
+      env,
+      `SELECT created_at, remark, client_txn_id
+         FROM entries
+        WHERE created_at >= ?
+          AND created_at < ?
+          AND client_txn_id NOT LIKE 'PROOF_%'
+        ORDER BY created_at ASC`,
+      monthlyWindow.startUtc,
+      monthlyWindow.endExclusiveUtc
+    ),
+  ]);
+
+  const sourceRows = filteredResult && filteredResult.results ? filteredResult.results : [];
+  const statsRows = [];
+
+  for (const row of sourceRows) {
+    const category = dashboardNormalizeCategory(row.remark);
+    const group = DASHBOARD_CATEGORY_GROUPS[category] || "";
+    if (!DASHBOARD_ACTIVE_GROUPS.includes(group)) continue;
+
+    const time = malaysiaPartsFromIso(row.created_at);
+    if (!time) continue;
+
+    statsRows.push({
+      category,
+      group,
+      tower: dashboardNormalizeTower(row.tower),
+      isNewRecord: !!toText(row.image_key),
+      time,
+    });
+  }
+
+  const totalRegistration = statsRows.length;
+  const hourlyMap = new Map();
+  const categoryMap = new Map();
+  const groupCounts = Object.fromEntries(DASHBOARD_GROUP_CHART_ORDER.map(group => [group, 0]));
+  const towerCounts = Object.fromEntries(DASHBOARD_ACTIVE_GROUPS.map(group => [group, { towerA: 0, towerB: 0 }]));
+  let newRecordCount = 0;
+
+  for (const row of statsRows) {
+    const hour = `${String(row.time.hour).padStart(2, "0")}:00`;
+    hourlyMap.set(hour, (hourlyMap.get(hour) || 0) + 1);
+    categoryMap.set(row.category || "UNKNOWN", (categoryMap.get(row.category || "UNKNOWN") || 0) + 1);
+    if (Object.prototype.hasOwnProperty.call(groupCounts, row.group)) groupCounts[row.group] += 1;
+
+    if (row.tower === "Tower A" || row.tower === "Tower A & B") towerCounts[row.group].towerA += 1;
+    if (row.tower === "Tower B" || row.tower === "Tower A & B") towerCounts[row.group].towerB += 1;
+
+    if (row.isNewRecord) newRecordCount += 1;
+  }
+
+  const existingRecordCount = totalRegistration - newRecordCount;
+  const hourlyTrend = Array.from(hourlyMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([hour, total]) => ({ hour, total }));
+
+  const peakHourEntry = Array.from(hourlyMap.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0];
+
+  const monthlyMap = new Map(monthlyWindow.buckets.map(bucket => [bucket.key, bucket]));
+  const monthlyRows = monthlyResult && monthlyResult.results ? monthlyResult.results : [];
+
+  for (const row of monthlyRows) {
+    const category = dashboardNormalizeCategory(row.remark);
+    const group = DASHBOARD_CATEGORY_GROUPS[category] || "";
+    if (!DASHBOARD_ACTIVE_GROUPS.includes(group)) continue;
+
+    const time = malaysiaPartsFromIso(row.created_at);
+    if (!time) continue;
+    const bucket = monthlyMap.get(time.year * 100 + time.month);
+    if (!bucket) continue;
+
+    if (group === "FOOD DELIVERY") bucket.foodDelivery += 1;
+    else if (group === "E-HAILING / DROP OFF / PICK UP") bucket.eHailing += 1;
+    else if (group === "PARCEL / COURIER") bucket.parcelCourier += 1;
+  }
+
+  const towerRows = DASHBOARD_ACTIVE_GROUPS.map(group => ({
+    group,
+    towerA: towerCounts[group].towerA,
+    towerB: towerCounts[group].towerB,
+  }));
+  const totalTowerA = towerRows.reduce((sum, row) => sum + row.towerA, 0);
+  const totalTowerB = towerRows.reduce((sum, row) => sum + row.towerB, 0);
+
+  return {
+    success: true,
+    source: "D1",
+    timezone: "Asia/Kuala_Lumpur",
+    period: {
+      startDate: range.startYmd,
+      endDate: range.endYmd,
+    },
+    lastUpdated: new Date().toISOString(),
+    summary: {
+      totalRegistration,
+      peakHour: peakHourEntry ? peakHourEntry[0] : "-",
+      recordFoundRate: dashboardPercentage(existingRecordCount, totalRegistration),
+      newRecordRate: dashboardPercentage(newRecordCount, totalRegistration),
+      existingRecordCount,
+      newRecordCount,
+    },
+    hourlyTrend,
+    monthlyTrend: monthlyWindow.buckets.map(bucket => ({
+      month: bucket.label,
+      foodDelivery: bucket.foodDelivery,
+      eHailing: bucket.eHailing,
+      parcelCourier: bucket.parcelCourier,
+    })),
+    categoryBreakdown: dashboardSortCountMap(categoryMap)
+      .map(([category, total]) => ({ category, total })),
+    groupCategoryBreakdown: DASHBOARD_GROUP_CHART_ORDER.map(group => ({
+      group,
+      total: groupCounts[group] || 0,
+      percentage: dashboardPercentage(groupCounts[group] || 0, totalRegistration),
+    })),
+    towerDistribution: {
+      rows: towerRows,
+      totalTowerA,
+      totalTowerB,
+      grandTotal: totalTowerA + totalTowerB,
+    },
+    recordStatus: [
+      {
+        status: "NEW RECORD",
+        total: newRecordCount,
+        percentage: dashboardPercentage(newRecordCount, totalRegistration),
+      },
+      {
+        status: "EXISTING RECORD",
+        total: existingRecordCount,
+        percentage: dashboardPercentage(existingRecordCount, totalRegistration),
+      },
+    ],
+  };
+}
+
+
+/** =========================
+ * Delivery Search Record (D1 read-only)
+ * - Protected by SEARCH_RECORD_TOKEN
+ * - Exact auto-detect search: MYKAD / PASSPORT / REG.NUM
+ * - Date / date-range search in Asia/Kuala_Lumpur
+ * - Latest records first
+ * - Fixed pagination: 50 rows per page
+ * - Internal PROOF_* rows are never exposed
+ * - Photo route uses the same token and never exposes R2 keys
+ * ========================= */
+const SEARCH_RECORD_PAGE_SIZE = 50;
+
+function searchRecordToken(env) {
+  return toText(env.SEARCH_RECORD_TOKEN);
+}
+
+function searchRecordAuthorized(request, env) {
+  const expected = searchRecordToken(env);
+  if (!expected) return false;
+
+  const auth = toText(request.headers.get("Authorization"));
+  if (!auth) return false;
+
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  return !!(match && toText(match[1]) === expected);
+}
+
+function detectDeliverySearchField(raw) {
+  const s = toUpper(raw);
+  const digitsOnly = s.replace(/[^0-9]/g, "");
+  const alnumOnly = s.replace(/[^A-Z0-9]/g, "");
+
+  if (digitsOnly.length === 12 && !/[A-Z]/.test(alnumOnly)) return "MYKADPASSPORT";
+  if (/^\d{6}-\d{2}-\d{4}$/.test(s)) return "MYKADPASSPORT";
+  if (/^[A-Z]{1,3}\d{6,}[A-Z]{3}$/.test(alnumOnly)) return "MYKADPASSPORT";
+  if (/^[A-Z]{1,3}\d{6,}$/.test(alnumOnly)) return "MYKADPASSPORT";
+
+  if (/^[A-Z]{1,3}\d{4}[A-Z]?$/.test(alnumOnly)) return "REGNUM";
+
+  // Keep the same fallback concept as the existing registration/GAS search.
+  return /[A-Z]/.test(alnumOnly) ? "REGNUM" : "MYKADPASSPORT";
+}
+
+function searchRecordMalaysiaTimestamp(value) {
+  const p = malaysiaPartsFromIso(value);
+  if (!p) return toText(value);
+
+  return `${String(p.day).padStart(2, "0")}/${String(p.month).padStart(2, "0")}/${String(p.year).padStart(4, "0")} ` +
+    `${String(p.hour).padStart(2, "0")}:${String(p.minute).padStart(2, "0")}:${String(p.second).padStart(2, "0")}`;
+}
+
+function searchRecordDisplayReason(reasonRaw, reasonOtherRaw) {
+  const reason = toUpper(reasonRaw);
+  const other = toUpper(reasonOtherRaw);
+
+  if (!reason && !other) return "";
+  if ((reason === "OTHER" || reason === "Other".toUpperCase()) && other) {
+    return `OTHER ( ${other} )`;
+  }
+  return reason || other;
+}
+
+function searchRecordPhotoAvailable(row) {
+  return !!(toText(row && row.image_key) || toText(row && row.drive_url));
+}
+
+function searchRecordPublicRow(row) {
+  const photoAvailable = searchRecordPhotoAvailable(row);
+
+  return {
+    id: toText(row.id),
+    createdAt: toText(row.created_at),
+    timestamp: searchRecordMalaysiaTimestamp(row.created_at),
+    namePassport: toUpper(row.name_passport),
+    mykadPassport: toUpper(row.mykad_passport),
+    regnum: toUpper(row.regnum),
+    contact: toText(row.contact),
+    category: toUpper(row.remark),
+    tower: toUpper(row.tower),
+    reason: searchRecordDisplayReason(row.reason, row.reason_other),
+    photoAvailable,
+    photoStatus: photoAvailable ? "PHOTO AVAILABLE" : "PHOTO EXPIRED",
+    photoEndpoint: photoAvailable
+      ? `/search-record/delivery/photo?id=${encodeURIComponent(toText(row.id))}`
+      : "",
+  };
+}
+
+function searchRecordPagination(page, totalMatch) {
+  const pageSize = SEARCH_RECORD_PAGE_SIZE;
+  const totalPages = Math.max(1, Math.ceil(totalMatch / pageSize));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+
+  return {
+    page: safePage,
+    pageSize,
+    totalMatch,
+    totalPages,
+    hasPrevious: safePage > 1,
+    hasNext: safePage < totalPages,
+    offset: (safePage - 1) * pageSize,
+  };
+}
+
+function searchRecordDateRange(startRaw, endRaw) {
+  const today = malaysiaTodayYmd();
+  const startValue = toText(startRaw) || toText(endRaw) || today;
+  const endValue = toText(endRaw) || toText(startRaw) || today;
+
+  const start = parseYmd(startValue);
+  const end = parseYmd(endValue);
+
+  if (!start || !end) {
+    throw new Error("Invalid date. Use YYYY-MM-DD.");
+  }
+
+  return dashboardResolveDateRange(start.ymd, end.ymd);
+}
+
+async function buildDeliverySearchRecord(env, url) {
+  const queryRaw = toText(url.searchParams.get("query"));
+  const pageRaw = clampInt(url.searchParams.get("page"), 1, 1, 1000000);
+
+  let mode = "";
+  let detectedField = "";
+  let normalizedQuery = "";
+  let period = null;
+  let whereSql = "";
+  let whereParams = [];
+
+  if (queryRaw) {
+    mode = "QUERY";
+    detectedField = detectDeliverySearchField(queryRaw);
+    normalizedQuery = normKey(queryRaw);
+
+    if (!normalizedQuery) {
+      throw new Error("Search input is empty.");
+    }
+
+    if (detectedField === "REGNUM") {
+      whereSql = "reg_norm = ?";
+    } else {
+      whereSql = "id_norm = ?";
+    }
+    whereParams = [normalizedQuery];
+  } else {
+    const startRaw = toText(url.searchParams.get("start"));
+    const endRaw = toText(url.searchParams.get("end"));
+
+    if (!startRaw && !endRaw) {
+      throw new Error("Provide query or start/end date.");
+    }
+
+    mode = "DATE";
+    period = searchRecordDateRange(startRaw, endRaw);
+    whereSql = "created_at >= ? AND created_at < ?";
+    whereParams = [period.startUtc, period.endExclusiveUtc];
+  }
+
+  const baseWhere = `${whereSql} AND client_txn_id NOT LIKE 'PROOF_%'`;
+
+  const countRow = await dbFirst(
+    env,
+    `SELECT COUNT(*) AS total
+       FROM entries
+      WHERE ${baseWhere}`,
+    ...whereParams
+  );
+
+  const totalMatch = Number(countRow && countRow.total ? countRow.total : 0);
+
+  // Overall STATUS must be based on ALL matching records, not only the
+  // current 50-row page. Pagination affects display only.
+  const photoEvidenceRow = totalMatch > 0
+    ? await dbFirst(
+        env,
+        `SELECT 1 AS has_photo
+           FROM entries
+          WHERE ${baseWhere}
+            AND (
+              (image_key IS NOT NULL AND image_key <> '')
+              OR
+              (drive_url IS NOT NULL AND drive_url <> '')
+            )
+          LIMIT 1`,
+        ...whereParams
+      )
+    : null;
+
+  const pagination = searchRecordPagination(pageRaw, totalMatch);
+
+  // If requested page is beyond the last page, use the last valid page.
+  const rowsResult = totalMatch > 0
+    ? await dbAll(
+        env,
+        `SELECT id, created_at,
+                name_passport, mykad_passport, regnum, contact,
+                remark, tower, reason, reason_other,
+                image_key, drive_url
+           FROM entries
+          WHERE ${baseWhere}
+          ORDER BY created_at DESC
+          LIMIT ${SEARCH_RECORD_PAGE_SIZE}
+          OFFSET ${pagination.offset}`,
+        ...whereParams
+      )
+    : { results: [] };
+
+  const rows = rowsResult && rowsResult.results ? rowsResult.results : [];
+  const records = rows.map(searchRecordPublicRow);
+
+  let status = "NO RECORD FOUND";
+  if (totalMatch > 0) {
+    status = photoEvidenceRow
+      ? "RECORD FOUND"
+      : "RECORD EXPIRED";
+  }
+
+  return {
+    success: true,
+    source: "D1",
+    timezone: "Asia/Kuala_Lumpur",
+    mode,
+    status,
+    detectedField: mode === "QUERY" ? detectedField : "",
+    query: mode === "QUERY" ? queryRaw : "",
+    normalizedQuery: mode === "QUERY" ? normalizedQuery : "",
+    period: mode === "DATE"
+      ? { startDate: period.startYmd, endDate: period.endYmd }
+      : null,
+    totalMatch,
+    pagination: {
+      page: pagination.page,
+      pageSize: pagination.pageSize,
+      totalPages: pagination.totalPages,
+      hasPrevious: pagination.hasPrevious,
+      hasNext: pagination.hasNext,
+    },
+    records,
+    lastUpdated: new Date().toISOString(),
+  };
+}
+
+async function getDeliverySearchRecordPhoto(env, id) {
+  const recordId = toText(id);
+  if (!recordId) return null;
+
+  const row = await dbFirst(
+    env,
+    `SELECT image_key, drive_url
+       FROM entries
+      WHERE id = ?
+        AND client_txn_id NOT LIKE 'PROOF_%'
+      LIMIT 1`,
+    recordId
+  );
+
+  if (!row) return null;
+
+  const imageKey = toText(row.image_key);
+  if (imageKey && env.BUCKET) {
+    const obj = await env.BUCKET.get(imageKey);
+    if (obj) {
+      return new Response(obj.body, {
+        status: 200,
+        headers: {
+          ...corsHeaders(),
+          "Content-Type": obj.httpMetadata?.contentType || "image/jpeg",
+          "Cache-Control": "private, no-store",
+        },
+      });
+    }
+  }
+
+  const driveUrl = toText(row.drive_url);
+  if (isHttpUrl(driveUrl)) {
+    return Response.redirect(driveUrl, 302);
+  }
+
+  return null;
+}
+
 /** =========================
  * Cleanup old records (retention days)
  * - Delete old D1 rows
@@ -672,6 +1321,141 @@ export default {
       const limit = url.searchParams.get("limit") || "";
       const result = await retryPendingSync(env, ctx, limit);
       return jsonResp(result, result.ok ? 200 : 400, cors);
+    }
+
+
+    // =========================
+    // GET /dashboard/delivery?start=YYYY-MM-DD&end=YYYY-MM-DD
+    // Read-only D1 statistics for the mobile Delivery Dashboard.
+    // =========================
+    if (request.method === "GET" && path === "/dashboard/delivery") {
+      if (!env.DB) {
+        return jsonResp({ success: false, message: "DB binding missing" }, 503, cors, {
+          "Cache-Control": "no-store",
+        });
+      }
+
+      try {
+        const result = await buildDeliveryDashboard(
+          env,
+          url.searchParams.get("start"),
+          url.searchParams.get("end")
+        );
+        return jsonResp(result, 200, cors, {
+          "Cache-Control": "no-store",
+        });
+      } catch (err) {
+        return jsonResp(
+          { success: false, message: cleanSyncError(err) || "Dashboard query failed" },
+          500,
+          cors,
+          { "Cache-Control": "no-store" }
+        );
+      }
+    }
+
+
+    // =========================
+    // GET /search-record/delivery
+    // Protected read-only D1 Search Record endpoint.
+    //
+    // Query search:
+    //   ?query=ABC1234&page=1
+    //
+    // Date / range search:
+    //   ?start=2026-08-01&end=2026-08-07&page=1
+    //
+    // Requires:
+    //   Authorization: Bearer <SEARCH_RECORD_TOKEN>
+    // =========================
+    if (request.method === "GET" && path === "/search-record/delivery") {
+      if (!env.DB) {
+        return jsonResp({ success: false, message: "DB binding missing" }, 503, cors, {
+          "Cache-Control": "no-store",
+        });
+      }
+
+      if (!searchRecordToken(env)) {
+        return jsonResp(
+          { success: false, message: "SEARCH_RECORD_TOKEN is not configured" },
+          503,
+          cors,
+          { "Cache-Control": "no-store" }
+        );
+      }
+
+      if (!searchRecordAuthorized(request, env)) {
+        return jsonResp(
+          { success: false, message: "Unauthorized" },
+          401,
+          cors,
+          {
+            "Cache-Control": "no-store",
+            "WWW-Authenticate": 'Bearer realm="Secure Entry Search Record"',
+          }
+        );
+      }
+
+      try {
+        const result = await buildDeliverySearchRecord(env, url);
+        return jsonResp(result, 200, cors, {
+          "Cache-Control": "no-store",
+        });
+      } catch (err) {
+        return jsonResp(
+          { success: false, message: cleanSyncError(err) || "Search Record query failed" },
+          400,
+          cors,
+          { "Cache-Control": "no-store" }
+        );
+      }
+    }
+
+    // =========================
+    // GET /search-record/delivery/photo?id=...
+    // Protected photo fetch for Search Record.
+    // Uses R2 first, then Drive URL fallback when available.
+    // Requires the same Authorization Bearer token.
+    // =========================
+    if (request.method === "GET" && path === "/search-record/delivery/photo") {
+      if (!searchRecordToken(env)) {
+        return jsonResp(
+          { success: false, message: "SEARCH_RECORD_TOKEN is not configured" },
+          503,
+          cors,
+          { "Cache-Control": "no-store" }
+        );
+      }
+
+      if (!searchRecordAuthorized(request, env)) {
+        return jsonResp(
+          { success: false, message: "Unauthorized" },
+          401,
+          cors,
+          {
+            "Cache-Control": "no-store",
+            "WWW-Authenticate": 'Bearer realm="Secure Entry Search Record"',
+          }
+        );
+      }
+
+      try {
+        const photoResponse = await getDeliverySearchRecordPhoto(
+          env,
+          url.searchParams.get("id")
+        );
+
+        return photoResponse || textResp("Not found", 404, cors, {
+          "Cache-Control": "no-store",
+        });
+      } catch (err) {
+        return jsonResp(
+          { success: false, message: cleanSyncError(err) || "Photo fetch failed" },
+          500,
+          cors,
+          { "Cache-Control": "no-store" }
+        );
+      }
     }
 
     // =========================
@@ -1017,6 +1801,7 @@ GAS_DELETE_URL    : optional (default = GAS_SYNC_URL)
 SYNC_TOKEN        : must match Apps Script SYNC_TOKEN
 PUBLIC_BASE_URL   : Worker public base URL (for imageViewUrl)
 IMAGE_VIEW_TOKEN  : token for /image
+SEARCH_RECORD_TOKEN : required bearer token for /search-record/delivery and /search-record/delivery/photo
 RETENTION_DAYS    : default 90
 SYNC_RETRY_START_AT : ISO date/time. Required for scheduled/manual retry, e.g. 2026-05-26T00:00:00.000Z
 SYNC_TRIES_PER_RUN  : optional, default 3
