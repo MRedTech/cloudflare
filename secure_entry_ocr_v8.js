@@ -26,8 +26,8 @@ export default {
         throw new Error("GEMINI_API_KEY is not set.");
       }
 
-      const PRIMARY_MODEL = (env.GEMINI_MODEL || "gemini-2.5-flash-lite").trim();
-      const FALLBACK_MODEL = (env.GEMINI_FALLBACK_MODEL || "gemini-3.1-flash-lite").trim();
+      const PRIMARY_MODEL = (env.GEMINI_MODEL || "gemini-3.1-flash-lite").trim();
+      const FALLBACK_MODEL = (env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash-lite").trim();
 
       /* ==================================================
          PASS 0 — PURE VISUAL QUALITY GATE
